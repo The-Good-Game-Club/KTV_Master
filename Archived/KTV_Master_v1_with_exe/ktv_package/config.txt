@@ -1,0 +1,8 @@
+;!@Install@!UTF-8!
+Title="KTV Karaoke Generator 安裝程式"
+BeginPrompt="KTV Karaoke Generator 將會安裝到你的電腦。\n此安裝程式將於 2027-06-05 到期。\n按「確定」繼續。"
+InstallPath="%%TEMP%%\\KTV_Karaoke"
+GUIMode="1"
+Shortcut="KTV Karaoke, KTV.exe"
+RunProgram="setup_ktv.exe"
+;!@InstallEnd@!
