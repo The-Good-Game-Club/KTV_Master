@@ -1,0 +1,9 @@
+stable-ts
+demucs
+soundfile
+yt-dlp
+torch
+torchaudio
+pypinyin
+duckduckgo-search
+youtube-transcript-api
