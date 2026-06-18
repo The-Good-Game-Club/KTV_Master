@@ -98,7 +98,7 @@ PRE_DISPLAY_SECONDS = 2.0
 ASS_STYLE = {
     "name": "Karaoke",
     "fontname": "Microsoft JhengHei",
-    "fontsize": 96,
+    "fontsize": 120,
     "primary": "&H00FFFFFF",
     "secondary": "&H0000CCFF",
     "outline": "&H00000000",
@@ -193,12 +193,14 @@ def check_dependencies(mode: str = "full") -> None:
 # ---------------------------------------------------------------------------
 
 def download_video(url: str, workdir: Path,
+                   max_height: int = 1080,
                    cookies_from_browser: str | None = None) -> tuple[Path, Path]:
     log.info("Downloading video from %s …", url)
     video_out = workdir / "%(title)s.%(ext)s"
+    fmt = f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_height}][ext=mp4]/mp4"
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/mp4",
+        "-f", fmt,
         "--merge-output-format", "mp4",
         "-o", str(video_out),
         "--embed-metadata",
@@ -405,6 +407,7 @@ def _write_ass_from_alignment(
                     parts = [f"{{\\k{max(1, int(round(lead_in * 100)))}}}"]
                 
                 ct_idx = 0
+                total_singing_cs = 0
                 for char in line:
                     if char.isspace():
                         # Keep original layout whitespace intact without breaking ASS tags
@@ -420,12 +423,16 @@ def _write_ass_from_alignment(
                                 nws = next_ct["start"]
                                 dur_cs = max(1, int(round((nws - cs_start) * 100)))
                             else:
+                                # Last character: leave 8cs grace before e so it fills EARLY
                                 dur_cs = max(1, int(round((cs_end - cs_start) * 100)))
+                                dur_cs = max(1, min(dur_cs, max(1, int(round((e - cs_start) * 100))) - 8))
                             
-                            parts.append(f"{{\\k{dur_cs}}}{char}")
+                            total_singing_cs += dur_cs
+                            parts.append(f"{{\\K{dur_cs}}}{char}")
                             ct_idx += 1
                         else:
-                            parts.append(f"{{\\k1}}{char}")
+                            parts.append(f"{{\\K1}}{char}")
+                            total_singing_cs += 1
             else:
                 # Fallback / Blind transcription standard mode
                 # Prepend KTV countdown dots in the same dialogue line
@@ -439,6 +446,7 @@ def _write_ass_from_alignment(
                     parts = [f"{{\\k{max(1, int(round(lead_in * 100)))}}}"]
                 words = getattr(seg, "words", None)
                 if words and len(words) > 0:
+                    total_singing_cs = 0
                     for i, w in enumerate(words):
                         wt = w.word.strip() if hasattr(w, "word") else str(w.get("word", "")).strip()
                         ws = float(w.start if hasattr(w, "start") else w.get("start", 0))
@@ -456,18 +464,26 @@ def _write_ass_from_alignment(
                         remainder = wdur_cs - wcs * (nc - 1) if nc > 1 else 0
                         for j, c in enumerate(wt):
                             dur_cs = wcs + remainder if j == nc - 1 and remainder > 0 else wcs
-                            parts.append(f"{{\\k{dur_cs}}}{c}")
+                            # Last character of LAST word: leave 8cs grace
+                            if i == len(words) - 1 and j == nc - 1:
+                                dur_cs = max(1, dur_cs - 8) if dur_cs > 8 else dur_cs
+                            total_singing_cs += dur_cs
+                            parts.append(f"{{\\K{dur_cs}}}{c}")
                 else:
                     text = seg.text.strip() if hasattr(seg, "text") else str(seg.get("text", "")).strip()
                     if not text:
                         continue
                     dur = max(e - s, 0.01)
                     cs = max(1, int(round(dur * 100 / len(text))))
-                    parts.extend(f"{{\\k{cs}}}{c}" for c in text)
+                    parts.extend(f"{{\\K{cs}}}{c}" for c in text)
+                    total_singing_cs = len(text) * cs
 
-            prev_end = e
+            GRACE_CS = 8  # centiseconds of grace after last char fills before line ends
+            last_fill_time = s + total_singing_cs / 100.0
+            new_e = min(e, last_fill_time + GRACE_CS / 100.0)
+            prev_end = new_e
             f.write(
-                f"Dialogue: 0,{_secs_to_ass(display_start)},{_secs_to_ass(e)},"
+                f"Dialogue: 0,{_secs_to_ass(display_start)},{_secs_to_ass(new_e)},"
                 f"{ASS_STYLE['name']},,0,0,0,,{' '.join(parts)}\n"
             )
 
@@ -819,16 +835,29 @@ def _get_video_info(url: str) -> dict:
 # Step 4 – Remux + subtitle burn-in
 # ---------------------------------------------------------------------------
 
+
+def _resolution_tag(max_height: int) -> str:
+    """Return short tag for non-1080p resolutions, e.g. '_4K', '_2K'."""
+    if max_height <= 1080:
+        return ""
+    tag = RESOLUTION_LABEL.get(max_height, f"{max_height}p")
+    # Shorten labels like '2160p(4K)' → '_4K', '1440p(2K)' → '_2K'
+    short = tag.replace("2160p(4K)", "4K").replace("1440p(2K)", "2K")
+    return f"_{short}"
+
+
 def remux(video_path: Path, accomp_path: Path, output_dir: Path,
-          subtitle_path: Path | None = None, pitch: int = 0) -> Path:
+          subtitle_path: Path | None = None, pitch: int = 0,
+          max_height: int = 1080) -> Path:
     stem = video_path.stem
     pitch_tag = ""
     if pitch != 0:
         pitch_tag = f"_pitch{pitch:+d}"
+    res_tag = _resolution_tag(max_height)
     if subtitle_path:
-        out_name = stem + pitch_tag + "_instrumental_karaoke.mp4"
+        out_name = stem + pitch_tag + res_tag + "_instrumental_karaoke.mp4"
     else:
-        out_name = stem + pitch_tag + "_instrumental.mp4"
+        out_name = stem + pitch_tag + res_tag + "_instrumental.mp4"
     out_path = output_dir / out_name
 
     # Avoid collision when same song is processed concurrently
@@ -836,9 +865,9 @@ def remux(video_path: Path, accomp_path: Path, output_dir: Path,
     while out_path.exists():
         suffix = f"_{counter}"
         if subtitle_path:
-            out_name = stem + pitch_tag + suffix + "_instrumental_karaoke.mp4"
+            out_name = stem + pitch_tag + res_tag + suffix + "_instrumental_karaoke.mp4"
         else:
-            out_name = stem + pitch_tag + suffix + "_instrumental.mp4"
+            out_name = stem + pitch_tag + res_tag + suffix + "_instrumental.mp4"
         out_path = output_dir / out_name
         counter += 1
 
@@ -922,8 +951,19 @@ def _clean_lyrics_local(text: str) -> str:
     return "\n".join(cleaned)
 
 
+# ── Resolution lookup ──────────────────────────────────────────
+
+RESOLUTION_MAP: dict[str, int] = {
+    "1080p": 1080,
+    "1440p(2K)": 1440,
+    "2160p(4K)": 2160,
+}
+
+RESOLUTION_LABEL: dict[int, str] = {v: k for k, v in RESOLUTION_MAP.items()}
+
+
 # ---------------------------------------------------------------------------
-# Entry point
+#  Entry point
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -973,6 +1013,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="BROWSER",
     )
+    parser.add_argument(
+        "--resolution", "-r",
+        default="1080p",
+        choices=list(RESOLUTION_MAP.keys()),
+        help="Output video resolution (default: 1080p). Falls back to highest available if source is lower.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1012,6 +1058,11 @@ def main() -> None:
 
     video_info = _get_video_info(url) if need_karaoke and not lyrics_text else None
 
+    # Resolve resolution to max height
+    res_key = args.resolution
+    max_height = RESOLUTION_MAP.get(res_key, 1080)
+    log.info("Target resolution: %s (max height=%d)", res_key, max_height)
+
     tmpdir = tempfile.mkdtemp(prefix="yt_karaoke_")
     workdir = Path(tmpdir)
     log.info("Working in temporary directory: %s", workdir)
@@ -1019,6 +1070,7 @@ def main() -> None:
     try:
         video_path, audio_path = download_video(
             url, workdir,
+            max_height=max_height,
             cookies_from_browser=args.cookies_from_browser,
         )
 
@@ -1038,7 +1090,8 @@ def main() -> None:
             )
 
         final_path = remux(video_path, accomp_path, args.output.resolve(),
-                           subtitle_path=subtitle_path, pitch=args.pitch)
+                           subtitle_path=subtitle_path, pitch=args.pitch,
+                           max_height=max_height)
 
         if args.keep_vocals and need_demucs:
             dest = args.output.resolve() / f"{video_path.stem}_vocals.wav"

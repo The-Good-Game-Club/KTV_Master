@@ -56,6 +56,7 @@ if getattr(sys, 'frozen', False):
 MODES = ("full", "lyrics_only", "vocal_only")
 MODELS = ("tiny", "base", "small", "medium", "large", "turbo")
 PITCH_RANGE = list(range(-12, 13))  # -12 to +12
+RESOLUTIONS = ("1080p", "1440p(2K)", "2160p(4K)")
 
 
 class KTVApp(tk.Tk):
@@ -114,6 +115,12 @@ class KTVApp(tk.Tk):
                 self.pitch_label.config(text=f"→ 升 {v} 個半音")
 
         self.pitch_var.trace_add("write", _on_pitch_change)
+
+        # Resolution
+        ttk.Label(self, text="Output Resolution:").pack(anchor="w", **pad)
+        self.res_var = tk.StringVar(value=RESOLUTIONS[0])
+        self.res_combo = ttk.Combobox(self, textvariable=self.res_var, values=RESOLUTIONS, state="readonly")
+        self.res_combo.pack(fill="x", **pad)
 
         # Output Folder
         ttk.Label(self, text="Output Folder:").pack(anchor="w", **pad)
@@ -187,6 +194,9 @@ class KTVApp(tk.Tk):
 
         if self._lyrics_file:
             cmd.extend(["--lyrics", self._lyrics_file])
+
+        # Resolution
+        cmd.extend(["--resolution", self.res_var.get()])
 
         self._log_clear()
         self._log(f"Starting command: {' '.join(cmd)}\n\n")
