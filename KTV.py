@@ -340,6 +340,8 @@ def _clean_for_alignment(text: str) -> str:
     """Prepare lyrics for stable-ts forced alignment. Preserves line breaks."""
     text = _clean_metadata(text)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
+    # Strip dual-line separator || — Whisper cannot align punctuation-only tokens
+    lines = [l.replace("||", "") for l in lines]
     return "\n".join(lines)
 
 
@@ -408,31 +410,42 @@ def _write_ass_from_alignment(
                 
                 ct_idx = 0
                 total_singing_cs = 0
-                for char in line:
-                    if char.isspace():
-                        # Keep original layout whitespace intact without breaking ASS tags
-                        parts.append(char)
-                    else:
-                        if ct_idx < len(char_timestamps):
-                            ct = char_timestamps[ct_idx]
-                            cs_start = ct["start"]
-                            cs_end = ct["end"]
-                            
-                            if ct_idx < len(char_timestamps) - 1:
-                                next_ct = char_timestamps[ct_idx + 1]
-                                nws = next_ct["start"]
-                                dur_cs = max(1, int(round((nws - cs_start) * 100)))
-                            else:
-                                # Last character: leave 8cs grace before e so it fills EARLY
-                                dur_cs = max(1, int(round((cs_end - cs_start) * 100)))
-                                dur_cs = max(1, min(dur_cs, max(1, int(round((e - cs_start) * 100))) - 8))
-                            
-                            total_singing_cs += dur_cs
-                            parts.append(f"{{\\K{dur_cs}}}{char}")
-                            ct_idx += 1
+                
+                # Dual-line support: split on || and insert \N between segments
+                if "||" in line:
+                    line1, line2 = line.split("||", 1)
+                    display_lines = [line1, line2]
+                else:
+                    display_lines = [line]
+                
+                for dl_idx, dl in enumerate(display_lines):
+                    if dl_idx > 0:
+                        parts.append("\\N")  # ASS newline between dual lines
+                    for char in dl:
+                        if char.isspace():
+                            # Keep original layout whitespace intact without breaking ASS tags
+                            parts.append(char)
                         else:
-                            parts.append(f"{{\\K1}}{char}")
-                            total_singing_cs += 1
+                            if ct_idx < len(char_timestamps):
+                                ct = char_timestamps[ct_idx]
+                                cs_start = ct["start"]
+                                cs_end = ct["end"]
+                                
+                                if ct_idx < len(char_timestamps) - 1:
+                                    next_ct = char_timestamps[ct_idx + 1]
+                                    nws = next_ct["start"]
+                                    dur_cs = max(1, int(round((nws - cs_start) * 100)))
+                                else:
+                                    # Last character: leave 8cs grace before e so it fills EARLY
+                                    dur_cs = max(1, int(round((cs_end - cs_start) * 100)))
+                                    dur_cs = max(1, min(dur_cs, max(1, int(round((e - cs_start) * 100))) - 8))
+                                
+                                total_singing_cs += dur_cs
+                                parts.append(f"{{\\\K{dur_cs}}}{char}")
+                                ct_idx += 1
+                            else:
+                                parts.append(f"{{\\\K1}}{char}")
+                                total_singing_cs += 1
             else:
                 # Fallback / Blind transcription standard mode
                 # Prepend KTV countdown dots in the same dialogue line
@@ -544,10 +557,12 @@ def generate_karaoke(
                 all_words.extend(seg.words)
         
         lines = [l.strip() for l in clean_text.split("\n") if l.strip()]
+        # Preserve original display lines (with || separators) before strip
+        orig_lines = [l.strip() for l in ref.split("\n") if l.strip()]
         new_segments = []
         w_idx = 0
-        
-        for line in lines:
+
+        for i, line in enumerate(lines):
             line_clean = "".join([c for c in line if not c.isspace()])
             if not line_clean:
                 continue
@@ -565,13 +580,14 @@ def generate_karaoke(
                 w_idx += 1
             
             if line_words:
+                display_line = orig_lines[i] if i < len(orig_lines) else line
                 class LineSegment:
                     def __init__(self, text, words):
                         self.text = text
                         self.words = words
                         self.start = words[0].start if hasattr(words[0], "start") else words[0].get("start", 0)
                         self.end = words[-1].end if hasattr(words[-1], "end") else words[-1].get("end", 0)
-                new_segments.append(LineSegment(line, line_words))
+                new_segments.append(LineSegment(display_line, line_words))
         
         class CustomResult:
             def __init__(self, segments):
@@ -1019,7 +1035,161 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=list(RESOLUTION_MAP.keys()),
         help="Output video resolution (default: 1080p). Falls back to highest available if source is lower.",
     )
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Analyze vocal range after separation, rename file to include range info.",
+    )
+    parser.add_argument(
+        "--music-bank",
+        type=Path,
+        default=Path(r"C:\Users\user\iCloudDrive\iCloud~md~obsidian\HappyUltimate\Music_Bank\generate_bank.py"),
+        help="Path to generate_bank.py for auto-adding analyzed songs.",
+    )
+    parser.add_argument(
+        "--artist", "-a",
+        default="",
+        help="Artist name for filename & Music Bank (e.g. 'IU', '林志炫').",
+    )
     return parser.parse_args(argv)
+
+
+def _analyze_and_rename(vocals_path: Path, final_path: Path, pitch: int,
+                         music_bank: Path | None, song_name: str,
+                         artist: str = "") -> Path:
+    """
+    Analyze vocals for key + vocal range using librosa.
+    Rename final_path to include range info.
+    Optionally append to generate_bank.py's SONGS list.
+    Returns the new (renamed) path.
+    """
+    import librosa
+    import numpy as np
+    import re as _re
+    import sys as _sys
+    # Fix Hermes venv contamination for scipy/librosa
+    _sys.path = [p for p in _sys.path if 'hermes' not in p.lower()]
+    import site as _site
+    _site.addsitedir(_site.getusersitepackages())
+
+    if not vocals_path or not vocals_path.exists():
+        log.warning("Vocals not available for analysis")
+        return final_path
+
+    try:
+        log.info("🔬 Analyzing vocal range …")
+        y, sr = librosa.load(str(vocals_path), sr=22050)
+
+        # ── Key detection (Krumhansl-Schmuckler) ──
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+        chroma_mean = np.mean(chroma, axis=1)
+        major_t = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+                            2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+        minor_t = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+                            2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+        notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        best = (-999, '', '')
+        for i in range(12):
+            for mode, tmpl in [('Maj', major_t), ('min', minor_t)]:
+                s = np.corrcoef(chroma_mean, np.roll(tmpl, i))[0, 1]
+                if s > best[0]:
+                    best = (s, notes[i], mode)
+
+        # ── Vocal range (pYIN) ──
+        f0, voiced, _ = librosa.pyin(y, fmin=65, fmax=1046, sr=sr, fill_na=np.nan)
+        f0_clean = f0[~np.isnan(f0)]
+
+        if len(f0_clean) < 100:
+            log.warning("Not enough vocal data for range detection")
+            return final_path
+
+        low_hz = np.percentile(f0_clean, 2)
+        high_hz = np.percentile(f0_clean, 98)
+        low_note = librosa.hz_to_note(low_hz).replace('♯', '#')
+        high_note = librosa.hz_to_note(high_hz).replace('♯', '#')
+        semitones = librosa.hz_to_midi(high_hz) - librosa.hz_to_midi(low_hz)
+
+        range_tag = f"{low_note}-{high_note}"
+        key_tag = f"{best[1]}{best[2]}"
+
+        log.info(f"📊  Key: {key_tag}  |  Range: {range_tag} ({semitones:.0f} semitones)")
+
+        # ── Rename final file: Artist_Song_pitch_Range.mp4 ──
+        parent = final_path.parent
+
+        # Clean song name for filename (remove special chars)
+        clean_song = _re.sub(r'[^\w\s-]', '', song_name).strip()
+        clean_song = _re.sub(r'\s+', '_', clean_song)[:50]
+
+        pitch_str = f"{pitch:+d}" if pitch != 0 else "0"
+        range_tag = f"{low_note}-{high_note}"
+
+        if artist:
+            new_name = f"{artist}_{clean_song}_{pitch_str}_{range_tag}.mp4"
+        else:
+            new_name = f"{clean_song}_{pitch_str}_{range_tag}.mp4"
+
+        new_path = parent / new_name
+
+        # Avoid collision
+        counter = 1
+        while new_path.exists():
+            stem_base = new_name.rsplit('.', 1)[0]
+            if artist:
+                new_name = f"{artist}_{clean_song}_{counter}_{pitch_str}_{range_tag}.mp4"
+            else:
+                new_name = f"{clean_song}_{counter}_{pitch_str}_{range_tag}.mp4"
+            new_path = parent / new_name
+            counter += 1
+
+        try:
+            final_path.rename(new_path)
+            log.info(f"📁 {new_path.name}")
+        except Exception:
+            log.warning(f"Could not rename to {new_name}, keeping original")
+
+        # ── Update Music Bank ──
+        if music_bank and music_bank.exists():
+            _add_to_music_bank(music_bank, song_name, low_note, high_note, pitch, artist)
+
+        return new_path
+
+    except Exception as e:
+        log.warning(f"Analysis failed: {e}")
+        return final_path
+
+
+def _add_to_music_bank(music_bank: Path, song_name: str,
+                        low_note: str, high_note: str, pitch: int,
+                        artist: str = "") -> None:
+    """Append a new song entry to generate_bank.py's SONGS list."""
+    import re as _re
+
+    try:
+        content = music_bank.read_text(encoding='utf-8')
+        pitch_str = f"{pitch:+d}" if pitch != 0 else "±0"
+        artist_clean = artist if artist else "—"
+        new_entry = f'    ("{song_name}", "{low_note}", "{high_note}", "{pitch_str}", 2, "4", "{artist_clean}"),'
+
+        # Insert before the last ']' in the SONGS list
+        lines = content.split('\n')
+        # Find the SONGS list section and add
+        in_songs = False
+        inserted = False
+        new_lines = []
+        for line in lines:
+            if '# === SONGS ===' in line:
+                in_songs = True
+            if in_songs and line.strip().startswith(']') and not inserted:
+                new_lines.append(new_entry)
+                inserted = True
+            new_lines.append(line)
+
+        if inserted:
+            music_bank.write_text('\n'.join(new_lines), encoding='utf-8')
+            log.info(f"📝 Added to Music Bank: {song_name} {low_note}-{high_note}")
+    except Exception as e:
+        log.warning(f"Music Bank update failed: {e}")
 
 
 def main() -> None:
@@ -1096,6 +1266,52 @@ def main() -> None:
         if args.keep_vocals and need_demucs:
             dest = args.output.resolve() / f"{video_path.stem}_vocals.wav"
             shutil.copy2(vocals_path, dest)
+
+        # ── Analyze vocal range + rename + Music Bank ──
+        if args.analyze and need_demucs:
+            # Extract clean song name from video title
+            import re as _re2
+            vid_title = video_path.stem
+            
+            # Step 1: Remove all bracketed content 【】, [], ()
+            clean = _re2.sub(r'[【\[\(][^】\]\)]*[】\]\)]', '', vid_title)
+            # Step 2: Remove artist prefix if specified (case-insensitive)
+            if args.artist:
+                clean = _re2.sub(_re2.escape(args.artist), '', clean, flags=_re2.IGNORECASE)
+            # Step 3: Remove Korean artist name in parentheses (아이유)
+            clean = _re2.sub(r'\([^)]*\)', '', clean)
+            # Step 4: Split on common separators and take the main title
+            # Look for English title segment (most reliable)
+            parts = _re2.split(r'[-–—|｜]', clean)
+            # Pick the longest segment that has meaningful content
+            if len(parts) > 1:
+                # Prefer segment with English letters that isn't OST/cover info
+                best = ''
+                for p in parts:
+                    p = p.strip()
+                    if _re2.search(r'[A-Za-z]{3,}', p) and not _re2.search(r'(OST|Cover|Live|M[Vv]|Official)', p, _re2.IGNORECASE):
+                        best = p
+                        break
+                if not best:
+                    best = parts[0].strip()
+                clean = best
+            
+            # Step 5: Remove common noise words at end
+            clean = _re2.sub(r'\s*(OST|M[Vv]|Official|Music|Video|Live|Concert|Lyrics|歌詞|中字|繁中|字幕|Part\d*)\s*', '', clean, flags=_re2.IGNORECASE)
+            # Step 6: Clean up whitespace and trim
+            clean = _re2.sub(r'\s+', ' ', clean).strip()
+            clean = clean.strip('-_ \t.')
+            
+            # Fallback if too short
+            if len(clean) < 3:
+                clean = vid_title.split('-')[0].split('|')[0].split('—')[0].strip()[:40]
+            
+            song_name = clean[:40]
+            log.info(f"🎵 Detected song: {song_name}")
+            final_path = _analyze_and_rename(
+                vocals_path, final_path, args.pitch,
+                args.music_bank, song_name, args.artist
+            )
 
         if need_karaoke and lyrics_text and lyrics_path and lyrics_path.exists():
             lyrics_path.write_text("", encoding="utf-8")
