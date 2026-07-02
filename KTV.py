@@ -21,9 +21,9 @@ USER MANUAL — Quick Start
   Vocal removal only (no subtitles):
       python KTV.py "URL" --mode vocal_only
 
-  Use a specific Whisper model (default: base):
-      python KTV.py "URL" --lyrics my_lyrics.txt -m tiny   (fast)
-      python KTV.py "URL" --lyrics my_lyrics.txt -m medium (accurate)
+  Use a specific Whisper model (default: turbo):
+      python KTV.py "URL" --lyrics my_lyrics.txt -m tiny   (fastest)
+      python KTV.py "URL" --lyrics my_lyrics.txt -m turbo  (default)
 
   Bypass YouTube anti-bot (close browser first):
       python KTV.py "URL" --cookies-from-browser chrome
@@ -53,7 +53,7 @@ Modes
 Models
 ------
   tiny   (fastest, less accurate)
-  base   (default, good balance)
+  turbo  (default, best accuracy/speed balance)
   small
   medium
   large
@@ -426,26 +426,31 @@ def _write_ass_from_alignment(
                             # Keep original layout whitespace intact without breaking ASS tags
                             parts.append(char)
                         else:
-                            if ct_idx < len(char_timestamps):
-                                ct = char_timestamps[ct_idx]
-                                cs_start = ct["start"]
-                                cs_end = ct["end"]
-                                
-                                if ct_idx < len(char_timestamps) - 1:
-                                    next_ct = char_timestamps[ct_idx + 1]
-                                    nws = next_ct["start"]
-                                    dur_cs = max(1, int(round((nws - cs_start) * 100)))
-                                else:
-                                    # Last character: leave 8cs grace before e so it fills EARLY
-                                    dur_cs = max(1, int(round((cs_end - cs_start) * 100)))
-                                    dur_cs = max(1, min(dur_cs, max(1, int(round((e - cs_start) * 100))) - 8))
-                                
-                                total_singing_cs += dur_cs
-                                parts.append(f"{{\\\K{dur_cs}}}{char}")
-                                ct_idx += 1
+                            if dl_idx > 0:
+                                # Translation line: plain static text, NO karaoke tags
+                                # Don't consume timestamps or inflate total_singing_cs
+                                parts.append(char)
                             else:
-                                parts.append(f"{{\\\K1}}{char}")
-                                total_singing_cs += 1
+                                    if ct_idx < len(char_timestamps):
+                                        ct = char_timestamps[ct_idx]
+                                        cs_start = ct["start"]
+                                        cs_end = ct["end"]
+
+                                        if ct_idx < len(char_timestamps) - 1:
+                                            next_ct = char_timestamps[ct_idx + 1]
+                                            nws = next_ct["start"]
+                                            dur_cs = max(1, int(round((nws - cs_start) * 100)))
+                                        else:
+                                            # Last character: leave 8cs grace before e so it fills EARLY
+                                            dur_cs = max(1, int(round((cs_end - cs_start) * 100)))
+                                            dur_cs = max(1, min(dur_cs, max(1, int(round((e - cs_start) * 100))) - 8))
+
+                                        total_singing_cs += dur_cs
+                                        parts.append(f"{{\\\\K{dur_cs}}}{char}")
+                                        ct_idx += 1
+                                    else:
+                                        parts.append(f"{{\\\\K1}}{char}")
+                                        total_singing_cs += 1
             else:
                 # Fallback / Blind transcription standard mode
                 # Prepend KTV countdown dots in the same dialogue line
@@ -1001,7 +1006,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--whisper-model", "-m",
-        default="base",
+        default="turbo",
         choices=("tiny", "base", "small", "medium", "large", "turbo"),
     )
     parser.add_argument(
