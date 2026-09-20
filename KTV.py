@@ -68,6 +68,7 @@ Dependencies
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -219,7 +220,9 @@ def download_video(url: str, workdir: Path,
     audio_out = workdir / "%(title)s.%(ext)s"
     audio_cmd = [
         sys.executable, "-m", "yt_dlp",
-        "-f", "bestaudio/best",
+        # Prefer m4a (AAC) audio: YouTube intermittently 403s the opus DASH
+        # format (251). m4a 140 (129k) is equal-or-better for Demucs + final AAC.
+        "-f", "bestaudio[ext=m4a]/bestaudio/best",
         "--extract-audio",
         "--audio-format", "wav",
         "--audio-quality", "0",
@@ -337,11 +340,17 @@ def _clean_metadata(text: str) -> str:
 
 
 def _clean_for_alignment(text: str) -> str:
-    """Prepare lyrics for stable-ts forced alignment. Preserves line breaks."""
+    """Prepare lyrics for stable-ts forced alignment. Preserves line breaks.
+
+    Dual-line lyrics (A||B): only the PRIMARY line (before ||) is aligned.
+    The translation line is static display text and must NOT enter the
+    alignment — non-matching chars get zero/interpolated timestamps that
+    drift the char-count line mapping, especially across silence gaps.
+    """
     text = _clean_metadata(text)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    # Strip dual-line separator || — Whisper cannot align punctuation-only tokens
-    lines = [l.replace("||", "") for l in lines]
+    # Keep only the primary (karaoke) line; drop the || translation
+    lines = [l.split("||", 1)[0].strip() for l in lines]
     return "\n".join(lines)
 
 
@@ -351,6 +360,44 @@ def _split_segments(result) -> None:
         result.split_by_gap(0.5)
     if hasattr(result, "split_by_length"):
         result.split_by_length(max_chars=LINE_MAX_CHARS)
+
+
+def _secs_to_srt(t: float) -> str:
+    """Convert seconds to SRT timestamp HH:MM:SS,mmm."""
+    ms = int(round(t * 1000))
+    h, rem = divmod(ms, 3600000)
+    m, rem2 = divmod(rem, 60000)
+    s, ms3 = divmod(rem2, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms3:03d}"
+
+
+def _write_srt_from_segments(srt_path: Path, segments) -> None:
+    """Write a plain SRT from alignment segments for pre-burn verification.
+
+    Dual-line lyrics (||) are rendered as two SRT subtitle lines.
+    """
+    blocks = []
+    idx = 0
+    for seg in segments:
+        s = float(getattr(seg, "start", 0) or 0)
+        e = float(getattr(seg, "end", 0) or 0)
+        text = (getattr(seg, "text", "") or "").replace("||", "\n").strip()
+        if not text:
+            continue
+        idx += 1
+        blocks.append(f"{idx}\n{_secs_to_srt(s)} --> {_secs_to_srt(e)}\n{text}")
+    srt_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+
+
+def _write_timing_summary(summary_path: Path, segments) -> None:
+    """Write a compact per-line timing table for quick agent/human checks."""
+    lines = []
+    for seg in segments:
+        s = float(getattr(seg, "start", 0) or 0)
+        e = float(getattr(seg, "end", 0) or 0)
+        text = (getattr(seg, "text", "") or "").replace("||", " | ").strip()
+        lines.append(f"{s:7.2f} -> {e:7.2f}  {text}")
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_ass_from_alignment(
@@ -505,6 +552,10 @@ def _write_ass_from_alignment(
                 f"{ASS_STYLE['name']},,0,0,0,,{' '.join(parts)}\n"
             )
 
+    # Pre-burn verification artifacts: plain SRT + per-line timing summary
+    _write_srt_from_segments(ass_path.with_suffix(".srt"), segments)
+    _write_timing_summary(ass_path.with_name(ass_path.stem + "_summary.txt"), segments)
+
 
 def generate_karaoke(
     vocals_path: Path,
@@ -536,8 +587,16 @@ def generate_karaoke(
         log.info("Karaoke subtitles written to %s (blind mode)", ass_path.name)
         return ass_path
 
-    clean_text = _clean_for_alignment(ref)
+    # Parse inline #SILENCE directives into per-block alignment slices
+    import soundfile as sf
+    track_duration = sf.info(str(vocals_path)).duration
+    chunks, blocks, silence_ranges = _parse_lyrics_blocks(ref, track_duration)
+    ref_display = "\n".join(chunks)
+    clean_text = _clean_for_alignment(ref_display)
     log.info("Cleaned lyrics: %d chars for forced alignment", len(clean_text))
+    if blocks:
+        log.info("Alignment blocks: %s",
+                 [(round(s, 1), round(e, 1)) for _, s, e in blocks])
 
     if not hasattr(model, "align"):
         log.warning("stable-ts align() not available; falling back to transcribe")
@@ -549,21 +608,27 @@ def generate_karaoke(
         return ass_path
 
     try:
-        log.info("Running forced alignment (stable-ts align) …")
-        result = model.align(str(vocals_path), clean_text, language="zh")
-        if result is None:
-            raise RuntimeError("align() returned None")
+        if silence_ranges or len(blocks) > 1:
+            log.info("Running per-block forced alignment (%d blocks) …",
+                     len(blocks))
+            all_words = _align_blocks(model, vocals_path, workdir, blocks)
+            if not all_words:
+                raise RuntimeError("block alignment produced no words")
+        else:
+            log.info("Running forced alignment (stable-ts align) …")
+            result = model.align(str(vocals_path), clean_text, language="zh")
+            if result is None:
+                raise RuntimeError("align() returned None")
+            all_words = []
+            for seg in result.segments:
+                if hasattr(seg, "words") and seg.words:
+                    all_words.extend(seg.words)
         
         # Core Improvement: Map AI outputs strictly back to the original text layout structures
         log.info("Re-segmenting alignment results to perfectly match original lines...")
-        all_words = []
-        for seg in result.segments:
-            if hasattr(seg, "words") and seg.words:
-                all_words.extend(seg.words)
-        
         lines = [l.strip() for l in clean_text.split("\n") if l.strip()]
         # Preserve original display lines (with || separators) before strip
-        orig_lines = [l.strip() for l in ref.split("\n") if l.strip()]
+        orig_lines = [l.strip() for l in ref_display.split("\n") if l.strip()]
         new_segments = []
         w_idx = 0
 
@@ -984,6 +1049,145 @@ RESOLUTION_LABEL: dict[int, str] = {v: k for k, v in RESOLUTION_MAP.items()}
 
 
 # ---------------------------------------------------------------------------
+#  Two-stage checkpoint (align-only → verify → burn-only)
+# ---------------------------------------------------------------------------
+
+def _checkpoint_base(output_dir: Path) -> Path:
+    return output_dir / "checkpoints"
+
+
+def _save_checkpoint(output_dir: Path, video_path: Path, accomp_path: Path,
+                     vocals_path: Path, subtitle_path: Path | None,
+                     meta: dict) -> Path:
+    """Copy Stage-1 artifacts into checkpoints/<video_stem>/ for Stage 2."""
+    base = _checkpoint_base(output_dir)
+    ckpt_dir = base / video_path.stem
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    for old in ckpt_dir.iterdir():
+        if old.is_file():
+            old.unlink()
+    shutil.copy2(video_path, ckpt_dir / video_path.name)
+    shutil.copy2(accomp_path, ckpt_dir / "accompaniment.wav")
+    shutil.copy2(vocals_path, ckpt_dir / "vocals.wav")
+    if subtitle_path and subtitle_path.exists():
+        shutil.copy2(subtitle_path, ckpt_dir / "karaoke.ass")
+        srt = subtitle_path.with_suffix(".srt")
+        if srt.exists():
+            shutil.copy2(srt, ckpt_dir / "karaoke.srt")
+        summary = subtitle_path.with_name(subtitle_path.stem + "_summary.txt")
+        if summary.exists():
+            shutil.copy2(summary, ckpt_dir / "karaoke_summary.txt")
+    meta.update({
+        "video_name": video_path.name,
+        "accomp_name": "accompaniment.wav",
+        "vocals_name": "vocals.wav",
+    })
+    (ckpt_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return ckpt_dir
+
+
+def _find_latest_checkpoint(output_dir: Path) -> Path | None:
+    base = _checkpoint_base(output_dir)
+    if not base.exists():
+        return None
+    dirs = [d for d in base.iterdir()
+            if d.is_dir() and (d / "meta.json").exists()]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda d: d.stat().st_mtime)
+
+
+def _time_str_to_sec(t: str) -> float:
+    parts = t.strip().split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(t)
+
+
+def _parse_lyrics_blocks(text: str, track_duration: float):
+    """Parse inline #SILENCE directives into alignment blocks.
+
+    Inline format: a #SILENCE line between lyric lines marks an audio gap.
+        #SILENCE 0:00-0:34          <- gap before the first block
+        <line1>||<translation>
+        ...
+        <lineN>||<translation>
+        #SILENCE 4:25-4:54          <- gap between blocks
+        <lineN+1>||<translation>
+
+    Returns (chunks, blocks, ranges):
+      chunks — list of raw text per block (directives removed, || kept)
+      blocks — list of (chunk_text, audio_start, audio_end) per block
+      ranges — list of (start_sec, end_sec) silence gaps
+    """
+    blocks: list[tuple[str, float, float]] = []
+    ranges: list[tuple[float, float]] = []
+    cur: list[str] = []
+    pending_start = 0.0
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.upper().startswith("#SILENCE"):
+            spec = s.split(None, 1)
+            gap = (0.0, 0.0)
+            if len(spec) > 1:
+                pairs = [p for p in spec[1].split(",") if p.strip()]
+                if pairs and "-" in pairs[0]:
+                    a, b = pairs[0].split("-", 1)
+                    gap = (_time_str_to_sec(a), _time_str_to_sec(b))
+                    ranges.append(gap)
+            if cur:
+                blocks.append(("\n".join(cur), pending_start, gap[0]))
+                cur = []
+            pending_start = max(gap[1], pending_start)
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append(("\n".join(cur), pending_start, track_duration))
+    chunks = [b[0] for b in blocks]
+    return chunks, blocks, ranges
+
+
+def _align_blocks(model, vocals_path: Path, workdir: Path,
+                  blocks: list[tuple[str, float, float]]) -> list[dict]:
+    """Align each lyrics block against its own audio slice, offset-merged.
+
+    Long audio gaps (harmony/interludes marked with #SILENCE) are CUT out of
+    the alignment input entirely, so whisper transcribes short contiguous
+    audio chunks and cannot drift or collapse across the gap.
+    """
+    import soundfile as sf
+
+    y, sr = sf.read(str(vocals_path), dtype="float32")
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    all_words: list[dict] = []
+    for bi, (chunk, s0, s1) in enumerate(blocks):
+        if not chunk.strip():
+            continue
+        i0, i1 = max(0, int(s0 * sr)), min(len(y), int(s1 * sr))
+        if i1 - i0 < sr:  # block shorter than 1s — skip
+            continue
+        tmp = workdir / f"_block{bi}.wav"
+        sf.write(str(tmp), y[i0:i1], sr)
+        res = model.align(str(tmp), _clean_for_alignment(chunk), language="zh")
+        if res is None:
+            log.warning("Block %d align returned None — skipping", bi)
+            continue
+        for sgm in res.segments:
+            for w in (sgm.words or []):
+                wt = w.word if hasattr(w, "word") else w.get("word", "")
+                ws = float(w.start if hasattr(w, "start") else w.get("start", 0))
+                we = float(w.end if hasattr(w, "end") else w.get("end", 0))
+                all_words.append({"word": wt, "start": ws + s0, "end": we + s0})
+        log.info("Block %d aligned: [%6.1f -> %6.1f] %d words",
+                 bi, s0, s1, len(all_words))
+    return all_words
+
+
+# ---------------------------------------------------------------------------
 #  Entry point
 # ---------------------------------------------------------------------------
 
@@ -1028,6 +1232,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--keep-vocals",
         action="store_true",
+    )
+    parser.add_argument(
+        "--align-only",
+        action="store_true",
+        help="Stage 1: stop after forced alignment. Saves a checkpoint "
+             "(karaoke.ass/.srt, video, accompaniment, vocals) under "
+             "checkpoints/<title>/ WITHOUT burning subtitles. "
+             "Verify karaoke.srt, then run --burn-only.",
+    )
+    parser.add_argument(
+        "--burn-only",
+        action="store_true",
+        help="Stage 2: resume from the latest checkpoint and burn subtitles "
+             "+ analyze + Music Bank. Skips download/Demucs/alignment. "
+             "Pitch/artist/analyze/resolution are restored from meta.json.",
     )
     parser.add_argument(
         "--cookies-from-browser",
@@ -1202,10 +1421,14 @@ def main() -> None:
     mode = args.mode
     check_dependencies(mode)
 
+    if args.align_only and args.burn_only:
+        log.error("--align-only and --burn-only are mutually exclusive.")
+        sys.exit(1)
+
     url = args.url
-    if not url:
+    if not url and not args.burn_only:
         url = input("YouTube video URL: ").strip()
-    if not url:
+    if not url and not args.burn_only:
         log.error("No URL provided.")
         sys.exit(1)
 
@@ -1214,7 +1437,7 @@ def main() -> None:
 
     lyrics_text: str | None = None
     lyrics_path = args.lyrics
-    if need_karaoke and lyrics_path.exists():
+    if not args.burn_only and need_karaoke and lyrics_path.exists():
         raw = lyrics_path.read_text(encoding="utf-8").strip()
         if raw:
             raw = _clean_lyrics_local(raw)
@@ -1224,45 +1447,88 @@ def main() -> None:
         else:
             log.info("Track B: %s is empty → will auto-fetch lyrics",
                      lyrics_path.name)
-    elif need_karaoke:
+    elif not args.burn_only and need_karaoke:
         log.info("Track B: no lyrics file → will auto-fetch lyrics")
 
-    if mode == "lyrics_only" and not lyrics_text:
+    if mode == "lyrics_only" and not lyrics_text and not args.burn_only:
         log.error("lyrics_only mode requires --lyrics with a non-empty file.")
         sys.exit(1)
 
-    video_info = _get_video_info(url) if need_karaoke and not lyrics_text else None
+    video_info = None
+    if not args.burn_only and need_karaoke and not lyrics_text:
+        video_info = _get_video_info(url)
 
     # Resolve resolution to max height
     res_key = args.resolution
     max_height = RESOLUTION_MAP.get(res_key, 1080)
     log.info("Target resolution: %s (max height=%d)", res_key, max_height)
 
-    tmpdir = tempfile.mkdtemp(prefix="yt_karaoke_")
-    workdir = Path(tmpdir)
-    log.info("Working in temporary directory: %s", workdir)
+    _from_checkpoint = False
+    if args.burn_only:
+        ckpt_dir = _find_latest_checkpoint(args.output.resolve())
+        if ckpt_dir is None:
+            log.error("No checkpoint found under %s — run --align-only first.",
+                      _checkpoint_base(args.output.resolve()))
+            sys.exit(1)
+        meta = json.loads((ckpt_dir / "meta.json").read_text(encoding="utf-8"))
+        video_path = ckpt_dir / meta["video_name"]
+        accomp_path = ckpt_dir / meta["accomp_name"]
+        vocals_path = ckpt_dir / meta["vocals_name"]
+        subtitle_path = ckpt_dir / "karaoke.ass"
+        if not subtitle_path.exists():
+            log.error("Checkpoint missing karaoke.ass: %s", ckpt_dir)
+            sys.exit(1)
+        # Restore Stage-1 settings from meta.json
+        args.pitch = int(meta.get("pitch", 0))
+        if meta.get("artist"):
+            args.artist = meta["artist"]
+        args.analyze = bool(meta.get("analyze", args.analyze))
+        max_height = int(meta.get("max_height", max_height))
+        need_demucs = True  # separation already happened in Stage 1
+        _from_checkpoint = True
+        workdir = ckpt_dir
+        log.info("🔥 Burn-only: resuming from checkpoint %s (pitch=%+d, artist=%s, analyze=%s)",
+                 ckpt_dir.name, args.pitch, args.artist or "(none)", args.analyze)
+    else:
+        tmpdir = tempfile.mkdtemp(prefix="yt_karaoke_")
+        workdir = Path(tmpdir)
+        log.info("Working in temporary directory: %s", workdir)
 
     try:
-        video_path, audio_path = download_video(
-            url, workdir,
-            max_height=max_height,
-            cookies_from_browser=args.cookies_from_browser,
-        )
-
-        if need_demucs:
-            accomp_path, vocals_path = separate_audio(audio_path, workdir)
-        else:
-            accomp_path = audio_path
-            vocals_path = audio_path
-
-        subtitle_path: Path | None = None
-        if need_karaoke:
-            subtitle_path = generate_karaoke(
-                vocals_path, workdir,
-                lyrics_text=lyrics_text,
-                model_name=args.whisper_model,
-                video_info=video_info,
+        if not _from_checkpoint:
+            video_path, audio_path = download_video(
+                url, workdir,
+                max_height=max_height,
+                cookies_from_browser=args.cookies_from_browser,
             )
+
+            if need_demucs:
+                accomp_path, vocals_path = separate_audio(audio_path, workdir)
+            else:
+                accomp_path = audio_path
+                vocals_path = audio_path
+
+            subtitle_path: Path | None = None
+            if need_karaoke:
+                subtitle_path = generate_karaoke(
+                    vocals_path, workdir,
+                    lyrics_text=lyrics_text,
+                    model_name=args.whisper_model,
+                    video_info=video_info,
+                )
+
+            if args.align_only:
+                meta = {
+                    "pitch": args.pitch,
+                    "artist": args.artist,
+                    "analyze": args.analyze,
+                    "max_height": max_height,
+                }
+                ckpt = _save_checkpoint(args.output.resolve(), video_path,
+                                        accomp_path, vocals_path, subtitle_path, meta)
+                log.info("✅ Checkpoint saved: %s", ckpt)
+                log.info("   Verify karaoke.srt + karaoke_summary.txt, then run --burn-only")
+                return
 
         final_path = remux(video_path, accomp_path, args.output.resolve(),
                            subtitle_path=subtitle_path, pitch=args.pitch,

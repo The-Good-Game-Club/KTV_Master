@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- 2026-09-21 (LU ruling: 大檔全部 gitignore) ----
+# rewritten out of unpushed history (files kept on disk):
+Archived/Kim_BumSoo_I_Miss_You_0_C2-A5_WRONG_TIMING.mp4
+IU_Give_You_My_Heart_-2_G3-G#5.mp4
+Kim BumSoo_I_Miss_You_0_C2-A5.mp4
